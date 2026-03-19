@@ -10,6 +10,7 @@ library: dynamodb-toolbox
 library_version: "local"
 sources:
   - "dynamodb-toolbox/dynamodb-toolbox:docs/docs/2-tables/1-usage/index.md"
+  - "dynamodb-toolbox/dynamodb-toolbox:docs/docs/2-tables/2-actions/2-query/index.md"
   - "dynamodb-toolbox/dynamodb-toolbox:docs/docs/3-entities/1-usage/index.md"
   - "dynamodb-toolbox/dynamodb-toolbox:docs/docs/3-entities/2-internal-attributes/index.md"
   - "dynamodb-toolbox/dynamodb-toolbox:src/entity/entity.ts"
@@ -89,6 +90,8 @@ const UserEntity = new Entity({
 
 ### Prefer multi-attribute indexes when DynamoDB supports the shape directly
 
+Multi-attribute GSIs let you index natural attributes directly instead of inventing synthetic concatenated keys. That keeps writes simpler, preserves type-safety on each attribute, and makes new access patterns easier to add later because DynamoDB indexes the existing attributes directly.
+
 ```ts
 const table = new Table({
   name: 'app-table',
@@ -107,6 +110,56 @@ const table = new Table({
 ```
 
 Use string concatenation only when the physical index really requires it.
+
+### Query multi-attribute GSIs with arrays, not synthetic key strings
+
+When a GSI uses `partitionKeys` or `sortKeys`, DynamoDB-Toolbox expects arrays in key order.
+
+```ts
+const TournamentTable = new Table({
+  name: 'tournament-matches',
+  documentClient,
+  partitionKey: { name: 'matchId', type: 'string' },
+  indexes: {
+    TournamentRegionIndex: {
+      type: 'global',
+      partitionKeys: [
+        { name: 'tournamentId', type: 'string' },
+        { name: 'region', type: 'string' }
+      ],
+      sortKeys: [
+        { name: 'round', type: 'string' },
+        { name: 'bracket', type: 'string' },
+        { name: 'matchId', type: 'string' }
+      ]
+    }
+  }
+})
+
+const { Items } = await TournamentTable.build(QueryCommand)
+  .query({
+    index: 'TournamentRegionIndex',
+    partition: ['WINTER2024', 'NA-EAST'],
+    range: ['SEMIFINALS', 'UPPER', { gte: 'match-002' }]
+  })
+  .send()
+```
+
+### Follow the multi-attribute query rules exactly
+
+- Supply every multi-attribute partition key component with equality semantics.
+- Query sort key components from left to right with no gaps.
+- Once you use an inequality or `begins_with`, it must be the final sort-key condition.
+
+Examples:
+
+- Valid: `partition: ['WINTER2024', 'NA-EAST']`
+- Valid: `range: ['SEMIFINALS']`
+- Valid: `range: ['SEMIFINALS', 'UPPER']`
+- Valid: `range: ['SEMIFINALS', 'UPPER', { gte: 'match-002' }]`
+- Invalid: `partition: ['WINTER2024']`
+- Invalid: `range: ['SEMIFINALS', 'match-002']`
+- Invalid: `range: [{ gte: 'SEMIFINALS' }, 'UPPER']`
 
 ## Common Mistakes
 
@@ -264,6 +317,67 @@ When DynamoDB supports the multi-attribute shape directly, extra string concaten
 
 Source: maintainer interview
 
+### HIGH Querying multi-attribute indexes as if they were concatenated strings
+
+Wrong:
+
+```ts
+await TournamentTable.build(QueryCommand)
+  .query({
+    index: 'TournamentRegionIndex',
+    partition: 'WINTER2024#NA-EAST',
+    range: 'SEMIFINALS#UPPER#match-002'
+  })
+  .send()
+```
+
+Correct:
+
+```ts
+await TournamentTable.build(QueryCommand)
+  .query({
+    index: 'TournamentRegionIndex',
+    partition: ['WINTER2024', 'NA-EAST'],
+    range: ['SEMIFINALS', 'UPPER', 'match-002']
+  })
+  .send()
+```
+
+For native multi-attribute GSIs, Toolbox query values map to attribute arrays in key order. Generating concatenated strings reintroduces the exact synthetic-key coupling that the feature removes.
+
+Source: dynamodb-toolbox/dynamodb-toolbox:docs/docs/2-tables/2-actions/2-query/index.md
+
+### HIGH Skipping key components or placing inequalities too early in a multi-attribute query
+
+Wrong:
+
+```ts
+await TournamentTable.build(QueryCommand)
+  .query({
+    index: 'TournamentRegionIndex',
+    partition: ['WINTER2024', 'NA-EAST'],
+    range: ['SEMIFINALS', { gte: 'match-002' }]
+  })
+  .send()
+```
+
+Correct:
+
+```ts
+await TournamentTable.build(QueryCommand)
+  .query({
+    index: 'TournamentRegionIndex',
+    partition: ['WINTER2024', 'NA-EAST'],
+    range: ['SEMIFINALS', 'UPPER', { gte: 'match-002' }]
+  })
+  .send()
+```
+
+Multi-attribute sort keys are queried left to right. You cannot skip `bracket` and then constrain `matchId`, and once an inequality appears it must be the last sort-key condition.
+
+Source: dynamodb-toolbox/dynamodb-toolbox:docs/docs/2-tables/2-actions/2-query/index.md
+
 ## References
 
 - [Table and entity options](references/table-entity-options.md)
+- [Multi-attribute indexes](references/multi-attribute-indexes.md)
